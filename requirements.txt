@@ -1,2 +1,6 @@
 ultralytics
+facenet-pytorch
 opencv-python
+matplotlib
+pandas
+numpy
