@@ -7,9 +7,10 @@ from collections import deque
 from ultralytics import YOLO
 from facenet_pytorch import InceptionResnetV1, MTCNN
 import matplotlib.patches as mpatches
+import plotly.graph_objects as go
 import shutil
 
-# Param
+# Params
 MODEL = "models/yolov8n-face.pt"
 VIDEO = "data/demo.mp4"
 OUTPUT_SRC = "runs"
@@ -17,17 +18,20 @@ FACE_SAMPLE = "face_samples"
 KNOWN_FACES = "known_faces"
 DIST_THRESHOLD = 50
 MAX_HISTORY = 30
+EMA_ALPHA = 0.2
+WARMUP_FRAMES = 30
 
-# Init models
+# Init
 model = YOLO(MODEL)
 mtcnn = MTCNN(keep_all=False, select_largest=True, post_process=True, device='cpu')
 resnet = InceptionResnetV1(pretrained='vggface2').eval()
 
-# Video loop
 prev_faces = {}
 next_id = 0
 track_history = {}
 motion_log = {}
+ema_state = {}
+ema_values_accum = []
 frame_idx = 0
 os.makedirs(FACE_SAMPLE, exist_ok=True)
 
@@ -73,7 +77,6 @@ while True:
 
         track_history[matched_id].append((cx, cy))
 
-        # Crop face and save
         x1, y1, x2, y2 = box
         face_crop = frame[y1:y2, x1:x2]
         if face_crop.size > 0 and frame_idx % 50 == 0:
@@ -82,24 +85,46 @@ while True:
             count = len(os.listdir(save_dir))
             cv2.imwrite(os.path.join(save_dir, f"{count}.jpg"), face_crop)
 
-        # Calculate motion
         if matched_id in prev_faces:
             px, py = prev_faces[matched_id]
             dx, dy = cx - px, cy - py
-            movement = np.sqrt(dx**2 + dy**2)
+            movement = np.sqrt(dx ** 2 + dy ** 2)
         else:
             movement = 0.0
+
+        prev_ema = ema_state.get(matched_id, 0.0)
+        curr_ema = EMA_ALPHA * movement + (1 - EMA_ALPHA) * prev_ema
+        ema_state[matched_id] = curr_ema
 
         if matched_id not in motion_log:
             motion_log[matched_id] = []
         motion_log[matched_id].append((frame_idx, movement))
 
-        # Draw box & ID
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, f"ID {matched_id}", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+        if frame_idx < WARMUP_FRAMES:
+            ema_values_accum.append(curr_ema)
+            mu_ema = 0
+            sigma_ema = 0
+        else:
+            mu_ema = np.mean(ema_values_accum)
+            sigma_ema = np.std(ema_values_accum)
 
-        # Draw trajectory
+        if frame_idx < WARMUP_FRAMES:
+            level = "Warming"
+            box_color = (128, 128, 128)
+        elif curr_ema > mu_ema + sigma_ema:
+            level = "Active"
+            box_color = (0, 0, 255)
+        elif curr_ema < mu_ema - sigma_ema:
+            level = "Inactive"
+            box_color = (150, 150, 150)
+        else:
+            level = "Normal"
+            box_color = (255, 255, 0)
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        label = f"ID {matched_id} ({level})"
+        cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+
         pts = track_history[matched_id]
         for i in range(1, len(pts)):
             cv2.line(frame, pts[i - 1], pts[i], (0, 0, 255), 2)
@@ -114,7 +139,7 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 
-# Encode known_faces
+# ========== Encode known_faces ==========
 def encode_known_faces(reference_dir):
     encodings = []
     names = []
@@ -138,7 +163,7 @@ def encode_known_faces(reference_dir):
 
 known_encodings, known_names = encode_known_faces(KNOWN_FACES)
 
-# Match faces
+# ========== Match sampled faces to known ==========
 id_to_name = {}
 for id_folder in os.listdir(FACE_SAMPLE):
     id_path = os.path.join(FACE_SAMPLE, id_folder)
@@ -164,46 +189,66 @@ for id_folder in os.listdir(FACE_SAMPLE):
     if not matched:
         id_to_name[int(id_folder.split('_')[1])] = id_folder
 
-# Store activity
+# ========== Store movement & EMA ==========
 records = []
 for id_, log in motion_log.items():
+    prev_ema = 0.0
     for frame_idx, movement in log:
-        records.append((frame_idx, id_, movement))
+        ema = EMA_ALPHA * movement + (1 - EMA_ALPHA) * prev_ema
+        records.append((frame_idx, id_, movement, ema))
+        prev_ema = ema
 
-df = pd.DataFrame(records, columns=["frame", "id", "movement"])
+df = pd.DataFrame(records, columns=["frame", "id", "movement", "ema"])
 df["name"] = df["id"].map(id_to_name)
 df.to_csv(f"{OUTPUT_SRC}/motion_activity.csv", index=False)
 
-# Plot movement over time
+# ========== Plot Rolling Mean ==========
 plt.figure(figsize=(12, 6))
 for name in df["name"].unique():
     df_pid = df[df["name"] == name].sort_values("frame")
     plt.plot(df_pid["frame"], df_pid["movement"].rolling(5, min_periods=1).mean(), label=name)
-
-df_avg = df[df["frame"] >= 4]
-if not df_avg.empty:
-    avg_movement = df_avg["movement"].mean()
-    plt.axhline(y=avg_movement, color='red', linestyle='--', label="Avg Active Level")
-
-plt.title("Movement Activity Over Time")
+plt.axhline(df["movement"].mean(), color='red', linestyle='--', label="Avg Movement")
+plt.title("Movement Activity Over Time (Rolling Avg)")
 plt.xlabel("Frame")
-plt.ylabel("Movement Magnitude")
+plt.ylabel("Movement")
 plt.legend()
-plt.grid(True)
 plt.tight_layout()
-plt.savefig(f"{OUTPUT_SRC}/motion_plot.png")
+plt.savefig(f"{OUTPUT_SRC}/motion_plot_rolling.png")
 
-# Plot Activity Index
-activity_df = df.groupby("name")["movement"].mean().reset_index()
-activity_df = activity_df.sort_values("movement", ascending=False)
+# ========== Plot EMA ==========
+plt.figure(figsize=(12, 6))
+for name in df["name"].unique():
+    df_pid = df[df["name"] == name].sort_values("frame")
+    plt.plot(df_pid["frame"], df_pid["ema"], label=name)
+plt.axhline(df["ema"].mean(), color='red', linestyle='--', label="Avg EMA")
+plt.title("Movement Activity Over Time (EMA Smoothed)")
+plt.xlabel("Frame")
+plt.ylabel("EMA")
+plt.legend()
+plt.tight_layout()
+plt.savefig(f"{OUTPUT_SRC}/motion_plot_ema.png")
 
-# Calculate threshold
-mu = activity_df["movement"].mean()
-sigma = activity_df["movement"].std()
+# ========== Interactive Plot ==========
+fig = go.Figure()
+for name in df["name"].unique():
+    df_pid = df[df["name"] == name].sort_values("frame")
+    fig.add_trace(go.Scatter(x=df_pid["frame"], y=df_pid["movement"].rolling(5, min_periods=1).mean(),
+                             mode='lines', name=f"{name} (Rolling)", line=dict(dash='dash')))
+    fig.add_trace(go.Scatter(x=df_pid["frame"], y=df_pid["ema"],
+                             mode='lines', name=f"{name} (EMA)", line=dict(dash='solid')))
+fig.update_layout(title="Interactive Comparison: EMA vs Rolling Avg",
+                  xaxis_title="Frame", yaxis_title="Movement", template="plotly_white")
+fig.write_html(f"{OUTPUT_SRC}/interactive_motion_comparison.html")
 
-# Match color with activeness
+# ========== Activity Index ==========
+activity_df = df.groupby("name")["ema"].mean().reset_index()
+activity_df.rename(columns={"ema": "activity_index"}, inplace=True)
+activity_df = activity_df.sort_values("activity_index", ascending=False)
+
+mu = activity_df["activity_index"].mean()
+sigma = activity_df["activity_index"].std()
 colors = []
-for val in activity_df["movement"]:
+for val in activity_df["activity_index"]:
     if val > mu + sigma:
         colors.append("red")
     elif val < mu - sigma:
@@ -211,14 +256,12 @@ for val in activity_df["movement"]:
     else:
         colors.append("skyblue")
 
-# Draw activity chart
 plt.figure(figsize=(10, 5))
-bars = plt.bar(activity_df["name"], activity_df["movement"], color=colors)
-plt.title("Activity Index per Student")
+bars = plt.bar(activity_df["name"], activity_df["activity_index"], color=colors)
+plt.title("Activity Index per Student (EMA)")
 plt.xlabel("Name")
 plt.ylabel("Activity Index")
 plt.grid(axis="y")
-
 for bar in bars:
     yval = bar.get_height()
     plt.text(bar.get_x() + bar.get_width()/2, yval + 0.1, f"{yval:.2f}", ha="center", va="bottom")
@@ -229,9 +272,8 @@ legend_handles = [
     mpatches.Patch(color='skyblue', label='Normal')
 ]
 plt.legend(handles=legend_handles)
-
 plt.tight_layout()
 plt.savefig(f"{OUTPUT_SRC}/activity_index.png")
 
-# CLeanup
+# ========== Cleanup ==========
 shutil.rmtree(FACE_SAMPLE)
